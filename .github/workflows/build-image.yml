@@ -1,0 +1,29 @@
+name: Build and push environment image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build-image.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to NRP GitLab registry
+        uses: docker/login-action@v3
+        with:
+          registry: gitlab-registry.nrp-nautilus.io
+          username: ${{ secrets.GITLAB_REGISTRY_USER }}
+          password: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: gitlab-registry.nrp-nautilus.io/alfiya11/geoglyph-env:${{ github.sha }}
