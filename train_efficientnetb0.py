@@ -12,6 +12,9 @@ unchanged from the notebook. What changed:
         <output_dir>/shared/data_splits.csv
   * hyperparameters are command-line arguments (one job per experiment)
   * ds.ignore_errors() now runs BEFORE batching (see note in make_dataset)
+  * resized images are cached ONCE in <output_dir>/shared/cache_<img_size>.npy
+    (same pixels the old per-epoch loading produced, but read from memory)
+  * --resume continues an interrupted run from the last finished epoch
 
 Usage (inside the batch job template):
     python train_efficientnetb0.py --data_dir /workspace/data \
@@ -73,6 +76,8 @@ def parse_args():
                    help="do not fail if no GPU is visible")
     p.add_argument("--overwrite", action="store_true",
                    help="allow reusing a run_name that already has results")
+    p.add_argument("--resume", action="store_true",
+                   help="continue an interrupted run with the SAME run_name")
     return p.parse_args()
 
 
@@ -118,30 +123,83 @@ def load_or_make_splits(df, shared_dir, seed):
     return split_df
 
 
-def make_dataset(dataframe, data_dir, img_size, batch_size, seed,
+def _load_image(path, img_size):
+    raw = tf.io.read_file(path)
+    image = tf.image.decode_image(raw, channels=3, expand_animations=False)
+    image = tf.image.resize(image, [img_size, img_size])
+    return tf.cast(image, tf.float32)
+
+
+def build_or_load_cache(rows_df, data_dir, img_size, cache_dir):
+    """Read + decode + resize every image ONCE and keep the result as one array.
+    Pixels are identical to what the per-epoch pipeline produced (float32, 0-255).
+    Images that fail to load are left out (and reported). The cache is shared by
+    all runs with the same img_size."""
+    cache_dir = Path(cache_dir)
+    npy = cache_dir / f"cache_{img_size}.npy"
+    idx = cache_dir / f"cache_{img_size}_index.csv"
+    if npy.exists() and idx.exists():
+        index_df = pd.read_csv(idx)
+        if set(rows_df["relpath"]) <= set(index_df["relpath"]) | \
+                set(pd.read_csv(idx.with_name(idx.stem + "_failed.csv"))["relpath"]
+                    if idx.with_name(idx.stem + "_failed.csv").exists() else []):
+            log(f"Using image cache: {npy}")
+            return np.load(npy), {r: i for i, r in enumerate(index_df["relpath"])}
+        log("Image cache exists but does not cover all images; rebuilding.")
+
+    log(f"Building image cache ({len(rows_df)} images, one-time read)...")
+    t = time.time()
+    rel = rows_df["relpath"].tolist()
+    paths = [str(Path(data_dir) / r) for r in rel]
+
+    def _load(path, relp):
+        return _load_image(path, img_size), relp
+
+    ds = tf.data.Dataset.from_tensor_slices((paths, rel))
+    ds = ds.map(_load, num_parallel_calls=tf.data.AUTOTUNE).ignore_errors()
+    ds = ds.batch(64).prefetch(tf.data.AUTOTUNE)
+    arrays, kept = [], []
+    for imgs, rels in ds:
+        arrays.append(imgs.numpy())
+        kept.extend(r.decode() for r in rels.numpy())
+        if len(kept) % 640 < 64:
+            log(f"  cached {len(kept)} / {len(rel)}")
+    arr = np.concatenate(arrays, axis=0)
+    failed = sorted(set(rel) - set(kept))
+    if failed:
+        log(f"WARNING: {len(failed)} images could not be loaded and are excluded: "
+            f"{failed[:5]}{' ...' if len(failed) > 5 else ''}")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cache_dir / f"cache_{img_size}.tmp{os.getpid()}.npy"
+    np.save(tmp, arr)
+    os.replace(tmp, npy)
+    pd.DataFrame({"relpath": kept}).to_csv(idx, index=False)
+    pd.DataFrame({"relpath": failed}).to_csv(
+        idx.with_name(idx.stem + "_failed.csv"), index=False)
+    log(f"Image cache built in {(time.time() - t) / 60:.1f} min: {arr.shape}")
+    return arr, {r: i for i, r in enumerate(kept)}
+
+
+def make_dataset(dataframe, cache_arr, cache_pos, batch_size, seed,
                  shuffle=False, with_path=False):
-    """tf.data pipeline. EfficientNet normalizes internally, so pixels stay [0,255].
-
-    NOTE: ignore_errors() comes BEFORE batch(). In the notebook it came after,
-    which drops a whole batch of 32 if one image fails to load; before batch it
-    skips only the bad image.
-    """
-    paths = [str(Path(data_dir) / p) for p in dataframe["relpath"]]
+    """tf.data pipeline over the in-memory cache. EfficientNet normalizes
+    internally, so pixels stay [0,255]. Images that failed to load are dropped."""
+    dataframe = dataframe[dataframe["relpath"].isin(cache_pos)].reset_index(drop=True)
+    pos = np.array([cache_pos[r] for r in dataframe["relpath"]], dtype=np.int64)
     labels = dataframe["label"].values.astype(np.float32)
-    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    rels = dataframe["relpath"].values.astype(str)
+    img_shape = cache_arr.shape[1:]
+
+    ds = tf.data.Dataset.from_tensor_slices((pos, labels, np.arange(len(pos))))
     if shuffle:
-        ds = ds.shuffle(buffer_size=len(dataframe), seed=seed,
-                        reshuffle_each_iteration=True)
+        ds = ds.shuffle(buffer_size=len(pos), seed=seed, reshuffle_each_iteration=True)
 
-    def _load(path, label):
-        raw = tf.io.read_file(path)
-        image = tf.image.decode_image(raw, channels=3, expand_animations=False)
-        image = tf.image.resize(image, [img_size, img_size])
-        image = tf.cast(image, tf.float32)
-        return image, tf.cast(label, tf.float32), path
+    def _get(p, label, i):
+        img = tf.numpy_function(lambda k: cache_arr[int(k)], [p], tf.float32)
+        img.set_shape(img_shape)
+        return img, label, tf.gather(tf.constant(rels), i)
 
-    ds = ds.map(_load, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.ignore_errors()
+    ds = ds.map(_get, num_parallel_calls=tf.data.AUTOTUNE)
     if not with_path:
         ds = ds.map(lambda i, l, p: (i, l))
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
@@ -184,11 +242,25 @@ def compile_model(model, lr, label_smoothing):
         ])
 
 
-def make_callbacks(ckpt_path, es_patience, min_lr):
+def best_val_auc(csv_path):
+    """Best val_auc_roc already logged (used so a resumed run never overwrites a
+    better checkpoint with a worse one)."""
+    try:
+        d = pd.read_csv(csv_path)
+        return float(d["val_auc_roc"].max())
+    except Exception:
+        return None
+
+
+def make_callbacks(ckpt_path, es_patience, min_lr, log_csv, backup_dir, resume):
     return [
+        keras.callbacks.BackupAndRestore(backup_dir=str(backup_dir),
+                                         save_freq="epoch", delete_checkpoint=False),
+        keras.callbacks.CSVLogger(str(log_csv), append=resume),
         keras.callbacks.ModelCheckpoint(
             filepath=str(ckpt_path), monitor="val_auc_roc", mode="max",
-            save_best_only=True, save_weights_only=True, verbose=1),
+            save_best_only=True, save_weights_only=True, verbose=1,
+            initial_value_threshold=best_val_auc(log_csv) if resume else None),
         keras.callbacks.EarlyStopping(
             monitor="val_auc_roc", mode="max", patience=es_patience,
             restore_best_weights=True, verbose=1),
@@ -243,6 +315,11 @@ def main():
     if (run_dir / "metrics.json").exists() and not args.overwrite:
         sys.exit(f"ERROR: {run_dir} already has results. Use a new --run_name "
                  "(or --overwrite) so earlier experiments are never replaced.")
+    if (run_dir / "config.json").exists() and not (args.resume or args.overwrite):
+        sys.exit(f"ERROR: {run_dir} holds an unfinished run. Use --resume to "
+                 "continue it, a new --run_name, or --overwrite to start over.")
+    if args.resume and not (run_dir / "config.json").exists():
+        sys.exit(f"ERROR: --resume given but {run_dir} has no earlier run to continue.")
     run_dir.mkdir(parents=True, exist_ok=True)
     shared_dir = Path(args.output_dir) / "shared"
 
@@ -287,7 +364,16 @@ def main():
     class_weight_dict = {0: cw[0], 1: cw[1]}
     log(f"Class weights: {class_weight_dict}")
 
-    mk = dict(data_dir=args.data_dir, img_size=args.img_size,
+    if args.smoke_test:
+        cache_rows = pd.concat([train_df, val_df, test_df])
+        cache_dir = run_dir
+    else:
+        cache_rows = split_df
+        cache_dir = shared_dir
+    cache_arr, cache_pos = build_or_load_cache(cache_rows, args.data_dir,
+                                               args.img_size, cache_dir)
+
+    mk = dict(cache_arr=cache_arr, cache_pos=cache_pos,
               batch_size=args.batch_size, seed=args.seed)
     train_ds = make_dataset(train_df, shuffle=True, **mk)
     val_ds = make_dataset(val_df, **mk)
@@ -311,19 +397,35 @@ def main():
         "n_train": len(train_df), "n_val": len(val_df), "n_test": len(test_df),
         "class_weights": {str(k): float(v) for k, v in class_weight_dict.items()},
     }
-    (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+    if args.resume:
+        with open(run_dir / "resume_log.txt", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} resumed, "
+                    f"git {os.environ.get('GIT_SHA', 'unknown')}\n")
+        log("RESUMING an earlier run (original config.json kept).")
+    else:
+        (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+
+    from types import SimpleNamespace
+    hist1_csv = run_dir / "history_stage1.csv"
+    hist2_csv = run_dir / "history_stage2.csv"
+    stage1_done = run_dir / "stage1_done.flag"
 
     # ---- stage 1: frozen backbone ----
     model = build_efficientnet_b0(args.img_size, args.dropout, args.dense_units,
                                   trainable_backbone=False)
     compile_model(model, args.lr_stage1, args.label_smoothing)
     ckpt1 = run_dir / "stage1_best.weights.h5"
-    log("\n=== Stage 1: frozen backbone ===")
-    h1 = model.fit(train_ds, validation_data=val_ds, epochs=args.epochs_stage1,
-                   class_weight=class_weight_dict,
-                   callbacks=make_callbacks(ckpt1, es_patience=7, min_lr=1e-6),
-                   verbose=2)
-    pd.DataFrame(h1.history).to_csv(run_dir / "history_stage1.csv", index=False)
+    if args.resume and stage1_done.exists():
+        log("\n=== Stage 1: already finished, skipping ===")
+    else:
+        log("\n=== Stage 1: frozen backbone ===")
+        model.fit(train_ds, validation_data=val_ds, epochs=args.epochs_stage1,
+                  class_weight=class_weight_dict,
+                  callbacks=make_callbacks(ckpt1, 7, 1e-6, hist1_csv,
+                                           run_dir / "backup_stage1", args.resume),
+                  verbose=2)
+        stage1_done.write_text("done")
+    h1 = SimpleNamespace(history=pd.read_csv(hist1_csv).to_dict("list"))
     if ckpt1.exists():
         model.load_weights(ckpt1)
 
@@ -333,11 +435,12 @@ def main():
     compile_model(model, args.lr_stage2, args.label_smoothing)
     ckpt2 = run_dir / "stage2_best.weights.h5"
     log("\n=== Stage 2: fine-tuning (BatchNorm frozen) ===")
-    h2 = model.fit(train_ds, validation_data=val_ds, epochs=args.epochs_stage2,
-                   class_weight=class_weight_dict,
-                   callbacks=make_callbacks(ckpt2, es_patience=8, min_lr=1e-7),
-                   verbose=2)
-    pd.DataFrame(h2.history).to_csv(run_dir / "history_stage2.csv", index=False)
+    model.fit(train_ds, validation_data=val_ds, epochs=args.epochs_stage2,
+              class_weight=class_weight_dict,
+              callbacks=make_callbacks(ckpt2, 8, 1e-7, hist2_csv,
+                                       run_dir / "backup_stage2", args.resume),
+              verbose=2)
+    h2 = SimpleNamespace(history=pd.read_csv(hist2_csv).to_dict("list"))
     if ckpt2.exists():
         model.load_weights(ckpt2)
     plot_history(h1, h2, run_dir / "training_curves.png")
