@@ -156,28 +156,45 @@ def build_or_load_cache(rows_df, data_dir, img_size, cache_dir):
         return _load_image(path, img_size), relp
 
     ds = tf.data.Dataset.from_tensor_slices((paths, rel))
-    ds = ds.map(_load, num_parallel_calls=tf.data.AUTOTUNE).ignore_errors()
-    ds = ds.batch(64).prefetch(tf.data.AUTOTUNE)
-    arrays, kept = [], []
+    ds = ds.map(_load, num_parallel_calls=8).ignore_errors()
+    ds = ds.batch(32).prefetch(2)
+
+    # Write straight into a file on disk (low memory use) instead of collecting
+    # everything in RAM first.
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cache_dir / f"cache_{img_size}.tmp{os.getpid()}.npy"
+    mm = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float32,
+                                   shape=(len(rel), img_size, img_size, 3))
+    kept, k, last = [], 0, 0
     for imgs, rels in ds:
-        arrays.append(imgs.numpy())
+        n = imgs.shape[0]
+        mm[k:k + n] = imgs.numpy()
+        k += n
         kept.extend(r.decode() for r in rels.numpy())
-        if len(kept) % 640 < 64:
-            log(f"  cached {len(kept)} / {len(rel)}")
-    arr = np.concatenate(arrays, axis=0)
+        if k - last >= 160:
+            last = k
+            el = time.time() - t
+            log(f"  cached {k} / {len(rel)}   ({el / 60:.1f} min, "
+                f"{k / max(el, 1):.1f} img/s)")
+    mm.flush()
     failed = sorted(set(rel) - set(kept))
     if failed:
         log(f"WARNING: {len(failed)} images could not be loaded and are excluded: "
             f"{failed[:5]}{' ...' if len(failed) > 5 else ''}")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp = cache_dir / f"cache_{img_size}.tmp{os.getpid()}.npy"
-    np.save(tmp, arr)
-    os.replace(tmp, npy)
+    if k == len(rel):
+        del mm
+        os.replace(tmp, npy)
+    else:  # some images failed: keep only the rows that were filled
+        part = np.array(mm[:k])
+        del mm
+        np.save(npy, part)
+        os.remove(tmp)
     pd.DataFrame({"relpath": kept}).to_csv(idx, index=False)
     pd.DataFrame({"relpath": failed}).to_csv(
         idx.with_name(idx.stem + "_failed.csv"), index=False)
-    log(f"Image cache built in {(time.time() - t) / 60:.1f} min: {arr.shape}")
-    return arr, {r: i for i, r in enumerate(kept)}
+    log(f"Image cache built in {(time.time() - t) / 60:.1f} min: "
+        f"({k}, {img_size}, {img_size}, 3)")
+    return np.load(npy), {r: i for i, r in enumerate(kept)}
 
 
 def make_dataset(dataframe, cache_arr, cache_pos, batch_size, seed,
